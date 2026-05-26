@@ -2,7 +2,20 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
-from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+from datetime import datetime, timedelta
+from uuid import uuid4
+from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders, submitted_restock_orders
+
+# Fixed lead times per inventory category (days). Used to compute
+# expected delivery on submitted restock orders.
+CATEGORY_LEAD_TIMES = {
+    'Circuit Boards': 14,
+    'Sensors': 7,
+    'Actuators': 21,
+    'Controllers': 10,
+    'Power Supplies': 14,
+}
+DEFAULT_LEAD_TIME_DAYS = 14
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -119,6 +132,48 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockRecommendation(BaseModel):
+    sku: str
+    name: str
+    category: str
+    warehouse: str
+    quantity_on_hand: int
+    reorder_point: int
+    unit_cost: float
+    forecasted_demand: int
+    forecast_source: str  # "forecast" if from demand_forecasts, else "reorder_proxy"
+    urgency: str  # "critical" (below reorder) or "moderate" (within 1.5x reorder)
+    recommended_quantity: int
+    line_total: float
+    lead_time_days: int
+
+class RestockOrderLine(BaseModel):
+    sku: str
+    name: str
+    category: str
+    quantity: int
+    unit_cost: float
+    line_total: float
+    lead_time_days: int
+    expected_delivery: str
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    created_date: str
+    status: str
+    items: List[RestockOrderLine]
+    total_value: float
+    lead_time_days: int  # max lead time across line items
+    expected_delivery: str
+
+class CreateRestockOrderLineRequest(BaseModel):
+    sku: str
+    quantity: int
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[CreateRestockOrderLineRequest]
 
 # API endpoints
 @app.get("/")
@@ -303,6 +358,121 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restock/recommendations", response_model=List[RestockRecommendation])
+def get_restock_recommendations():
+    """Recommend inventory items to restock, ranked by stock urgency + forecasted demand.
+
+    Candidate set: items where quantity_on_hand <= 1.5 * reorder_point. (Strict "below
+    reorder point" yields only ~4 items in the demo dataset, so we widen the net to
+    surface a useful range of recommendations.)
+
+    Forecast: joined by SKU to demand_forecasts when available; otherwise the
+    reorder_point is used as a proxy demand signal.
+    """
+    forecast_by_sku = {f['item_sku']: f for f in demand_forecasts}
+    recommendations = []
+
+    for item in inventory_items:
+        if item['quantity_on_hand'] > item['reorder_point'] * 1.5:
+            continue
+
+        forecast = forecast_by_sku.get(item['sku'])
+        if forecast:
+            forecasted_demand = forecast['forecasted_demand']
+            forecast_source = 'forecast'
+        else:
+            forecasted_demand = item['reorder_point']
+            forecast_source = 'reorder_proxy'
+
+        # Restock target: top up to 2x reorder point, but at least cover forecasted demand.
+        recommended_quantity = max(
+            item['reorder_point'] * 2 - item['quantity_on_hand'],
+            forecasted_demand,
+        )
+        urgency = 'critical' if item['quantity_on_hand'] <= item['reorder_point'] else 'moderate'
+        lead_time = CATEGORY_LEAD_TIMES.get(item['category'], DEFAULT_LEAD_TIME_DAYS)
+
+        recommendations.append({
+            'sku': item['sku'],
+            'name': item['name'],
+            'category': item['category'],
+            'warehouse': item['warehouse'],
+            'quantity_on_hand': item['quantity_on_hand'],
+            'reorder_point': item['reorder_point'],
+            'unit_cost': item['unit_cost'],
+            'forecasted_demand': forecasted_demand,
+            'forecast_source': forecast_source,
+            'urgency': urgency,
+            'recommended_quantity': recommended_quantity,
+            'line_total': round(recommended_quantity * item['unit_cost'], 2),
+            'lead_time_days': lead_time,
+        })
+
+    # Sort: critical first, then by forecasted_demand desc.
+    recommendations.sort(
+        key=lambda r: (0 if r['urgency'] == 'critical' else 1, -r['forecasted_demand'])
+    )
+    return recommendations
+
+
+@app.get("/api/restock-orders", response_model=List[RestockOrder])
+def list_restock_orders():
+    """Return all submitted restock orders, newest first."""
+    return sorted(submitted_restock_orders, key=lambda o: o['created_date'], reverse=True)
+
+
+@app.post("/api/restock-orders", response_model=RestockOrder, status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Submit a restock order. Items are resolved against current inventory; lead time
+    is computed per item from its category, and the order's overall expected delivery
+    is the latest line-level delivery date."""
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Order must include at least one item")
+
+    inventory_by_sku = {i['sku']: i for i in inventory_items}
+    now = datetime.now()
+    lines = []
+    total_value = 0.0
+    max_lead_time = 0
+
+    for line_req in request.items:
+        if line_req.quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"Quantity for {line_req.sku} must be positive")
+        item = inventory_by_sku.get(line_req.sku)
+        if not item:
+            raise HTTPException(status_code=404, detail=f"SKU {line_req.sku} not found in inventory")
+
+        lead_time = CATEGORY_LEAD_TIMES.get(item['category'], DEFAULT_LEAD_TIME_DAYS)
+        expected_delivery = (now + timedelta(days=lead_time)).strftime('%Y-%m-%d')
+        line_total = round(line_req.quantity * item['unit_cost'], 2)
+
+        lines.append({
+            'sku': item['sku'],
+            'name': item['name'],
+            'category': item['category'],
+            'quantity': line_req.quantity,
+            'unit_cost': item['unit_cost'],
+            'line_total': line_total,
+            'lead_time_days': lead_time,
+            'expected_delivery': expected_delivery,
+        })
+        total_value += line_total
+        max_lead_time = max(max_lead_time, lead_time)
+
+    order = {
+        'id': str(uuid4()),
+        'order_number': f"RST-{now.strftime('%Y%m%d')}-{len(submitted_restock_orders) + 1:04d}",
+        'created_date': now.strftime('%Y-%m-%dT%H:%M:%S'),
+        'status': 'Submitted',
+        'items': lines,
+        'total_value': round(total_value, 2),
+        'lead_time_days': max_lead_time,
+        'expected_delivery': (now + timedelta(days=max_lead_time)).strftime('%Y-%m-%d'),
+    }
+    submitted_restock_orders.append(order)
+    return order
+
 
 if __name__ == "__main__":
     import uvicorn

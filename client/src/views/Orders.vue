@@ -8,6 +8,51 @@
     <div v-if="loading" class="loading">{{ t('common.loading') }}</div>
     <div v-else-if="error" class="error">{{ error }}</div>
     <div v-else>
+      <!-- Submitted Restock Orders — only shown when at least one exists -->
+      <div v-if="submittedOrders.length > 0" class="card">
+        <div class="card-header">
+          <h3 class="card-title">Submitted Restock Orders ({{ submittedOrders.length }})</h3>
+        </div>
+        <div class="table-container">
+          <table class="restock-orders-table">
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Created</th>
+                <th>Items</th>
+                <th>Total</th>
+                <th>Lead Time</th>
+                <th>Expected Delivery</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="order in submittedOrders" :key="order.id">
+                <td><strong>{{ order.order_number }}</strong></td>
+                <td>{{ formatDate(order.created_date) }}</td>
+                <td>
+                  <details class="items-details">
+                    <summary class="items-summary">
+                      {{ order.items.length }} item{{ order.items.length !== 1 ? 's' : '' }}
+                    </summary>
+                    <div class="items-dropdown">
+                      <div v-for="item in order.items" :key="item.sku" class="item-entry">
+                        <span class="item-name">{{ item.name }}</span>
+                        <span class="item-meta">{{ item.sku }} &mdash; Qty: {{ item.quantity }} @ ${{ item.unit_cost.toLocaleString() }}</span>
+                      </div>
+                    </div>
+                  </details>
+                </td>
+                <td><strong>${{ order.total_value.toLocaleString() }}</strong></td>
+                <td>{{ order.lead_time_days }} days</td>
+                <td>{{ formatDate(order.expected_delivery) }}</td>
+                <td><span class="badge info">{{ order.status }}</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="stats-grid">
         <div class="stat-card success">
           <div class="stat-label">{{ t('status.delivered') }}</div>
@@ -95,6 +140,7 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    const submittedOrders = ref([])
 
     // Use shared filters
     const {
@@ -105,11 +151,23 @@ export default {
       getCurrentFilters
     } = useFilters()
 
+    const loadSubmittedOrders = async () => {
+      try {
+        submittedOrders.value = await api.getRestockOrders()
+      } catch (err) {
+        // Non-fatal: submitted orders section simply stays hidden
+        console.error('Failed to load submitted restock orders:', err)
+      }
+    }
+
     const loadOrders = async () => {
       try {
         loading.value = true
         const filters = getCurrentFilters()
-        const fetchedOrders = await api.getOrders(filters)
+        const [fetchedOrders] = await Promise.all([
+          api.getOrders(filters),
+          loadSubmittedOrders()
+        ])
 
         // Sort orders by order_date (earliest first)
         orders.value = fetchedOrders.sort((a, b) => {
@@ -160,6 +218,7 @@ export default {
       loading,
       error,
       orders,
+      submittedOrders,
       getOrdersByStatus,
       getOrderStatusClass,
       formatDate,
@@ -174,6 +233,11 @@ export default {
 <style scoped>
 /* Fixed table layout to prevent column shifting */
 .orders-table {
+  table-layout: fixed;
+  width: 100%;
+}
+
+.restock-orders-table {
   table-layout: fixed;
   width: 100%;
 }
